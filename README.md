@@ -1,68 +1,50 @@
-# Buttery Taskbar 2 (Deprecated)
+# Buttery Taskbar 3
 
-> [!NOTE]
-> This project has been superseded by [Buttery Desktop](https://www.crypticbutter.com/buttery-desktop/), which has an improved design and additional features such as mouse pressure to reveal the taskbar. You can try it for free.
+Hides the Windows taskbar until you need it, and works on current versions of Windows 11.
 
-> [!WARNING]
-> **This software is unmaintained and does not work properly on the latest versions of Windows 11.**
->
-> In order to make development sustainable, all maintenance and support efforts are now focused on [Buttery Desktop](https://www.crypticbutter.com/buttery-desktop/). Please check it out to support my work.
+This goes further than the built-in auto-hide: moving the mouse to the bottom of the screen does not bring the taskbar back. To show it, press the Windows key or scroll at the bottom edge of the screen.
 
-<p align="center">
-<img width="540" src="https://github.com/LuisThiamNye/miscellaneous-media/blob/8714fceb0cc01309fd2402f4887c2ee7e106656c/buttery-taskbar-feature-image.png">
-</p>
+This is a C# rewrite of [ButteryTaskbar2](https://github.com/LuisThiamNye/ButteryTaskbar2) by Luis Thiam-Nye, which stopped working on newer Windows 11 builds. The original Jai source files are still in the repo for reference.
 
-Save space on your screen by hiding the taskbar when it's not needed. This goes beyond the built-in auto-hide feature; it prevents the taskbar being shown by the mouse cursor. To reveal the taskbar, press the Windows key to open the Start menu.
+## Features
 
-**New:** Don't want to use the keyboard? Now you can scroll with the mouse at the bottom of the screen to show the Start menu as well!
+- The taskbar stays hidden unless:
+  - you are holding down the Windows key, or
+  - the Start menu, search, Task View, the tray overflow or the notification centre is open.
+- Scroll at the bottom edge of the primary monitor to open the Start menu (can be turned off).
+- Optional `Ctrl` + `Win` + `F11` shortcut to turn hiding on or off (off by default).
+- Option to keep Windows' own auto-hide turned on when Buttery Taskbar is disabled.
+- Tray icon (a yellow block of butter) with a settings menu. Left-click or right-click it.
 
-This is the successor to the original [Buttery Taskbar](https://github.com/CrypticButter/ButteryTaskbar) where you will find further rationale for this program. Version 2 has lower CPU and memory usage, and should work more reliably overall.
+Settings are saved to `%LocalAppData%\ButteryTaskbar3\config.json`.
 
-<img width="260"
-     align="right"
-     src="https://github.com/LuisThiamNye/miscellaneous-media/blob/f1283d276b8d6d0a9899d2a7c9c3baca74ca3c8b/buttery-taskbar-screenshot-2.3.0.png">
+## Building
 
-## Features and behaviour
+You need the [.NET 9 SDK](https://dotnet.microsoft.com/download) or newer.
 
-- The taskbar is shown under these conditions:
-	- Holding down the Windows key.
-	- The Start menu or other special windows like the tray overflow window, notification area, action centre, or task view are active.
-- Scroll at the bottom edge of the primary monitor to open the Start menu (optional).
-- Tray icon for accessing the settings menu, which also shows available software updates.
-- Enable or disable functionality with the shortcut: `Ctrl` + `Win` + `F11` (optional, disabled by default).
-- Option to automatically enable/disable Windows taskbar auto-hide when disabling Buttery Taskbar.
-
-## Installation
-
-The program is provided as a single executable and no installer. [Download it here](https://github.com/LuisThiamNye/ButteryTaskbar2/releases/) (or [via scoop](#installing-via-scoop)) and just run the program.
-
-If you want it to run at log-in, I recommend creating an entry in Task Scheduler. There are plenty of instructions online for how to make a program run at log-in with Task Scheduler.
-
-Important: In the properties window of the Task Scheduler entry you create for Buttery Taskbar:
-- In the "General" tab, **check** "Run with highest privileges". This means Buttery Taskbar can work when you are using apps ran as administrator.
-- In the "Conditions" tab, consider **uncheck**ing "Start the task only if the computer is on AC power" (for laptops).
-- In the "Settings" tab, **uncheck** "Stop the task if it runs longer than".
-
-You might notice that in Buttery Taskbar's tray menu, there is a "start at log-in" option. Keep this turned off if you followed the above steps. Unlike the Task Scheduler method, this option will not start Buttery Taskbar as administrator, and hence Buttery Taskbar will not work properly when the current focused window is running as administrator.
-
-## Installing via Scoop
-
-If you install the program via [scoop](https://scoop.sh/), the executable can then be found at `C:\Users\<username>\scoop\apps\buttery-taskbar\current\`
-
-```pwsh
-scoop bucket add CrypticButter https://github.com/CrypticButter/ScoopBucket
-scoop install CrypticButter/buttery-taskbar
+```powershell
+dotnet publish src -c Release -r win-x64
 ```
 
-## Further details
+The executable ends up in `src\bin\Release\net9.0-windows\win-x64\publish\ButteryTaskbar3.exe`. It needs the .NET 9 Desktop Runtime installed to run.
 
-- The taskbar's visibility is updated each time you switch focus between windows (including opening the Start menu).
-- There is intentionally a short delay after releasing the Windows key before the taskbar is allowed to hide again.
+## Running at log-in
 
-## Donations
+Create a Task Scheduler entry that runs `ButteryTaskbar3.exe` at log-on. In its properties:
 
-Bitcoin: `bc1qhgfyn3f2c56xwmsalekfntkxjgj6t73dt4ymjj`
+- **General** tab: tick "Run with highest privileges". Without this, the Windows key detection stops working while an app running as administrator has focus.
+- **Conditions** tab: on laptops, untick "Start the task only if the computer is on AC power".
+- **Settings** tab: untick "Stop the task if it runs longer than".
 
-Ethereum: `0x8AABE26364304267537da5fa956081a6925D2e40`
+## Quitting
 
-Cardano: `addr1q85zwgetxpru4g6fyvsz4h292mwaru2we22u8xckwv8yqrmgrzy93wur7z4zzmhj8eyr3dw5dyj97crvvxafdxjddags6xgeef`
+Use **Quit** in the tray menu. This puts the taskbar back the way it was.
+
+If the process is killed instead (Task Manager, `Stop-Process`), it has no chance to clean up and the taskbar stays hidden. To get it back, either:
+
+- start Buttery Taskbar again and choose **Quit** from the tray menu, or
+- restart Windows Explorer from Task Manager, then turn off "Automatically hide the taskbar" in Settings > Personalisation > Taskbar > Taskbar behaviours.
+
+## License
+
+[Eclipse Public License 2.0](LICENSE), the same as the original project.
