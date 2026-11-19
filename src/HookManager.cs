@@ -3,64 +3,50 @@ using static ButteryTaskbar3.NativeMethods;
 
 namespace ButteryTaskbar3;
 
+// Low-level hook callbacks must return quickly or Windows silently removes the hook,
+// so anything slow (saving config, talking to Explorer) is posted back to the UI thread.
 internal sealed class HookManager : IDisposable
 {
     private IntPtr _keyboardHook;
     private IntPtr _mouseHook;
-    private LowLevelProc? _keyboardProc;
-    private LowLevelProc? _mouseProc;
+    private readonly LowLevelProc _keyboardProc;
+    private readonly LowLevelProc _mouseProc;
     private readonly TaskbarManager _taskbar;
     private readonly Func<Config> _getConfig;
-    private readonly Action _onToggle;
+    private readonly Action _requestToggle;
 
-    public HookManager(TaskbarManager taskbar, Func<Config> getConfig, Action onToggle)
+    public HookManager(TaskbarManager taskbar, Func<Config> getConfig, Action requestToggle)
     {
         _taskbar = taskbar;
         _getConfig = getConfig;
-        _onToggle = onToggle;
+        _requestToggle = requestToggle;
+        _keyboardProc = KeyboardHookProc;
+        _mouseProc = MouseHookProc;
     }
 
-    public void UpdateHooks(bool menuActive)
+    public void UpdateHooks()
     {
         var config = _getConfig();
-        bool wantKeyboard = (config.Enabled || config.ToggleShortcutEnabled) && !menuActive;
-        bool wantMouse = config.Enabled && config.ScrollActivationEnabled && !menuActive;
+        SetHook(ref _keyboardHook, WH_KEYBOARD_LL, _keyboardProc, config.Enabled || config.ToggleShortcutEnabled);
+        SetHook(ref _mouseHook, WH_MOUSE_LL, _mouseProc, config.Enabled && config.ScrollActivationEnabled);
+    }
 
-        bool hasKeyboard = _keyboardHook != IntPtr.Zero;
-        bool hasMouse = _mouseHook != IntPtr.Zero;
-
-        if (hasKeyboard != wantKeyboard)
+    private static void SetHook(ref IntPtr hook, int type, LowLevelProc proc, bool wanted)
+    {
+        if (wanted && hook == IntPtr.Zero)
         {
-            if (wantKeyboard)
-            {
-                _keyboardProc = KeyboardHookProc;
-                _keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, _keyboardProc,
-                    GetModuleHandle(null), 0);
-            }
-            else
-            {
-                UnhookWindowsHookEx(_keyboardHook);
-                _keyboardHook = IntPtr.Zero;
-                _keyboardProc = null;
-            }
+            hook = SetWindowsHookEx(type, proc, GetModuleHandle(null), 0);
+            if (hook == IntPtr.Zero)
+                Log.Write($"SetWindowsHookEx({type}) failed: {Marshal.GetLastWin32Error()}");
         }
-
-        if (hasMouse != wantMouse)
+        else if (!wanted && hook != IntPtr.Zero)
         {
-            if (wantMouse)
-            {
-                _mouseProc = MouseHookProc;
-                _mouseHook = SetWindowsHookEx(WH_MOUSE_LL, _mouseProc,
-                    GetModuleHandle(null), 0);
-            }
-            else
-            {
-                UnhookWindowsHookEx(_mouseHook);
-                _mouseHook = IntPtr.Zero;
-                _mouseProc = null;
-            }
+            UnhookWindowsHookEx(hook);
+            hook = IntPtr.Zero;
         }
     }
+
+    private static bool IsKeyDown(int vk) => (GetAsyncKeyState(vk) & 0x8000) != 0;
 
     private IntPtr KeyboardHookProc(int nCode, IntPtr wParam, IntPtr lParam)
     {
@@ -69,47 +55,33 @@ internal sealed class HookManager : IDisposable
             var info = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
             int msg = wParam.ToInt32();
             var config = _getConfig();
+            bool isWin = info.vkCode is VK_LWIN or VK_RWIN;
 
-            if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN)
+            if (msg is WM_KEYDOWN or WM_SYSKEYDOWN)
             {
-                if (HandleKeyDown(info.vkCode, config))
-                    return (IntPtr)1;
-            }
-            else if (msg == WM_KEYUP || msg == WM_SYSKEYUP)
-            {
-                if ((info.vkCode == VK_LWIN || info.vkCode == VK_RWIN) && config.Enabled)
+                if (isWin && config.Enabled && !_taskbar.WinKeyDown)
                 {
-                    int otherKey = info.vkCode == VK_LWIN ? VK_RWIN : VK_LWIN;
-                    _taskbar.IsWinKeyDown = (GetKeyState(otherKey) & 0x80) != 0;
-                    _taskbar.ExtendVisibility(400);
+                    Log.Write("Win down");
+                    _taskbar.WinKeyDown = true;
                 }
+                else if (info.vkCode == VK_F11 && config.ToggleShortcutEnabled
+                         && IsKeyDown(VK_CONTROL) && (IsKeyDown(VK_LWIN) || IsKeyDown(VK_RWIN)))
+                {
+                    _requestToggle();
+                    return 1;
+                }
+            }
+            else if (msg is WM_KEYUP or WM_SYSKEYUP && isWin && _taskbar.WinKeyDown)
+            {
+                // Not gated on Enabled, so toggling off while Win is held can't leave the flag stuck on.
+                int otherWin = info.vkCode == VK_LWIN ? VK_RWIN : VK_LWIN;
+                Log.Write("Win up");
+                _taskbar.WinKeyDown = IsKeyDown(otherWin);
+                _taskbar.KeepVisibleFor(400);
             }
         }
 
-        return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
-    }
-
-    private bool HandleKeyDown(uint vk, Config config)
-    {
-        switch (vk)
-        {
-            case VK_LWIN:
-            case VK_RWIN:
-                if (config.Enabled && !_taskbar.IsWinKeyDown)
-                    _taskbar.IsWinKeyDown = true;
-                break;
-
-            case VK_F11:
-                bool ctrl = (GetKeyState(VK_CONTROL) & 0x80) != 0;
-                bool win = (GetKeyState(VK_LWIN) & 0x80) != 0 || (GetKeyState(VK_RWIN) & 0x80) != 0;
-                if (ctrl && win && config.ToggleShortcutEnabled)
-                {
-                    _onToggle();
-                    return true;
-                }
-                break;
-        }
-        return false;
+        return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
     }
 
     private IntPtr MouseHookProc(int nCode, IntPtr wParam, IntPtr lParam)
@@ -117,42 +89,27 @@ internal sealed class HookManager : IDisposable
         if (nCode >= 0 && wParam.ToInt32() == WM_MOUSEWHEEL)
         {
             var info = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
-            int delta = (short)(info.mouseData >> 16);
-            if (delta != 0 && HandleMouseScroll(info.pt.X, info.pt.Y))
-                return (IntPtr)1;
+            var bounds = Screen.PrimaryScreen!.Bounds;
+            bool atBottomEdge = info.pt.Y >= bounds.Bottom - 2
+                && info.pt.X >= bounds.Left && info.pt.X < bounds.Right;
+
+            if (atBottomEdge && !_taskbar.ShowForFocus)
+            {
+                Log.Write("Scroll at bottom edge: opening Start");
+                _taskbar.ShowForFocus = true;
+                _taskbar.RequestOpenStart();
+                return 1;
+            }
         }
 
-        return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
-    }
-
-    private bool HandleMouseScroll(int mouseX, int mouseY)
-    {
-        var rect = _taskbar.PrimaryMonitorFull;
-        // Check if cursor is at the bottom edge of the primary monitor (full bounds, not work area)
-        if (mouseY >= rect.Bottom - 2
-            && mouseX >= rect.Left
-            && mouseX < rect.Right
-            && !_taskbar.ShouldShowDueToFocus)
-        {
-            _taskbar.ShouldShowDueToFocus = true;
-            _taskbar.SendWinKeyPress = true;
-            _taskbar.SignalUpdate();
-            return true;
-        }
-        return false;
+        return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
     }
 
     public void Dispose()
     {
-        if (_keyboardHook != IntPtr.Zero)
-        {
-            UnhookWindowsHookEx(_keyboardHook);
-            _keyboardHook = IntPtr.Zero;
-        }
-        if (_mouseHook != IntPtr.Zero)
-        {
-            UnhookWindowsHookEx(_mouseHook);
-            _mouseHook = IntPtr.Zero;
-        }
+        if (_keyboardHook != IntPtr.Zero) UnhookWindowsHookEx(_keyboardHook);
+        if (_mouseHook != IntPtr.Zero) UnhookWindowsHookEx(_mouseHook);
+        _keyboardHook = IntPtr.Zero;
+        _mouseHook = IntPtr.Zero;
     }
 }

@@ -4,309 +4,182 @@ using static ButteryTaskbar3.NativeMethods;
 
 namespace ButteryTaskbar3;
 
-internal sealed class TaskbarManager : IDisposable
+// All show/hide calls on the taskbar windows happen on this class's worker thread.
+internal sealed class TaskbarManager
 {
-    private readonly List<IntPtr> _taskbarHwnds = [];
-    private readonly object _lock = new();
-    private Thread? _thread;
     private readonly ManualResetEventSlim _wake = new(false);
+    private Thread? _thread;
     private volatile bool _stopping;
-    private volatile bool _shouldShow = true;
+    private volatile bool _showForFocus = true;
     private volatile bool _winKeyDown;
-    private volatile bool _sendWinKeyPress;
-    private long _stayVisibleUntilTicks;
+    private volatile bool _openStartRequested;
+    private long _keepVisibleUntil;
 
-    // Known "core" windows (Start menu, etc.) tracked across activations
-    private readonly HashSet<IntPtr> _coreWindows = [];
-
-    // Windows 11 barrier window: sits at the bottom edge to block auto-hide mouse trigger
-    private IntPtr _barrierHwnd;
-    private WndProc? _barrierWndProc; // prevent GC
-
-    private static readonly long TicksPerMs;
-
-    static TaskbarManager()
+    public bool ShowForFocus
     {
-        QueryPerformanceFrequency(out var freq);
-        TicksPerMs = freq / 1000;
+        get => _showForFocus;
+        set { _showForFocus = value; _wake.Set(); }
     }
 
-    public bool IsWinKeyDown
+    public bool WinKeyDown
     {
         get => _winKeyDown;
-        set
-        {
-            _winKeyDown = value;
-            SignalUpdate();
-        }
+        set { _winKeyDown = value; _wake.Set(); }
     }
 
-    public bool SendWinKeyPress
+    // Covers the gap between releasing the Win key and the Start menu becoming the foreground window.
+    public void KeepVisibleFor(int milliseconds)
     {
-        set => _sendWinKeyPress = value;
+        Interlocked.Exchange(ref _keepVisibleUntil, Environment.TickCount64 + milliseconds);
+        _wake.Set();
     }
 
-    public bool ShouldShowDueToFocus
+    public void RequestOpenStart()
     {
-        get => _shouldShow;
-        set
-        {
-            _shouldShow = value;
-            SignalUpdate();
-        }
+        _openStartRequested = true;
+        _wake.Set();
     }
 
-    private static long NowMs()
-    {
-        QueryPerformanceCounter(out var ticks);
-        return ticks / TicksPerMs;
-    }
-
-    public void ExtendVisibility(int ms)
-    {
-        Interlocked.Exchange(ref _stayVisibleUntilTicks, NowMs() + ms);
-        SignalUpdate();
-    }
+    public void Wake() => _wake.Set();
 
     public void Start()
     {
-        _thread = new Thread(TaskbarLoop) { IsBackground = true, Name = "TaskbarManager" };
+        _thread = new Thread(Loop) { IsBackground = true, Name = "TaskbarManager" };
         _thread.Start();
     }
 
-    public void SignalUpdate() => _wake.Set();
-
-    public void RefreshTaskbarState()
+    public void Stop()
     {
-        var fg = GetForegroundWindow();
-        if (fg == IntPtr.Zero)
-        {
-            ShouldShowDueToFocus = false;
-            return;
-        }
-
-        var className = GetWindowClassName(fg);
-        var processName = GetProcessName(fg);
-
-        if (IsSystemOverlayWindow(className, processName))
-        {
-            ShouldShowDueToFocus = true;
-            return;
-        }
-
-        // Track CoreWindow handles (used by Start menu, etc.)
-        if (className == "Windows.UI.Core.CoreWindow")
-        {
-            _coreWindows.Add(fg);
-        }
-
-        // Check if any known core window is the foreground
-        bool show = false;
-        foreach (var hwnd in _coreWindows)
-        {
-            if (hwnd == fg)
-            {
-                show = true;
-                break;
-            }
-        }
-        ShouldShowDueToFocus = show;
+        _stopping = true;
+        _wake.Set();
+        _thread?.Join(2000);
     }
 
-    public void SetAutoHideState(bool enabled, bool autoHideWhenDisabled)
+    private void Loop()
     {
-        RefreshTaskbars();
-        if (_taskbarHwnds.Count == 0) return;
-
-        var abd = new APPBARDATA
-        {
-            cbSize = Marshal.SizeOf<APPBARDATA>(),
-            hWnd = _taskbarHwnds[0],
-            lParam = (enabled || autoHideWhenDisabled) ? (IntPtr)ABS_AUTOHIDE : IntPtr.Zero,
-        };
-        SHAppBarMessage(ABM_SETSTATE, ref abd);
-    }
-
-    private void TaskbarLoop()
-    {
-        while (!_stopping)
+        while (true)
         {
             _wake.Wait();
             _wake.Reset();
-            if (_stopping) break;
+            if (_stopping) return;
 
-            RefreshTaskbars();
-            RefreshPrimaryMonitor();
-
-            if (_sendWinKeyPress)
+            if (_openStartRequested)
             {
-                _sendWinKeyPress = false;
-                SimulateWinKeyPress();
+                _openStartRequested = false;
+                SimulateWinKeyTap();
             }
 
+            var taskbars = FindTaskbars();
             int attempts = 0;
             while (attempts < 60 && !_stopping)
             {
-                bool shouldShow = _shouldShow || _winKeyDown || NowMs() < Interlocked.Read(ref _stayVisibleUntilTicks);
+                bool inGracePeriod = Environment.TickCount64 < Interlocked.Read(ref _keepVisibleUntil);
+                bool show = _showForFocus || _winKeyDown || inGracePeriod;
 
                 bool allCorrect = true;
-                foreach (var hwnd in _taskbarHwnds)
+                foreach (var hwnd in taskbars)
                 {
-                    SetTaskbarWindowVisibility(hwnd, shouldShow);
-                    if (IsWindowVisible(hwnd) != shouldShow)
-                        allCorrect = false;
+                    ShowWindow(hwnd, show ? SW_SHOWNOACTIVATE : SW_HIDE);
+                    if (IsWindowVisible(hwnd) != show) allCorrect = false;
                 }
 
-                // Manage barrier window
-                UpdateBarrier(!shouldShow);
-
-                if (NowMs() < Interlocked.Read(ref _stayVisibleUntilTicks))
+                if (inGracePeriod)
                 {
                     attempts = 0;
                     Thread.Sleep(100);
                 }
                 else if (!allCorrect)
                 {
-                    Thread.Sleep(10);
                     attempts++;
+                    Thread.Sleep(10);
                 }
-                else if (shouldShow)
+                else if (show)
                 {
                     break;
                 }
                 else
                 {
-                    Thread.Sleep(50);
+                    // Explorer sometimes re-shows the taskbar right after we hide it, so keep re-hiding briefly.
                     attempts += 8;
+                    Thread.Sleep(50);
                 }
             }
         }
     }
 
-    private void RefreshTaskbars()
+    private static List<IntPtr> FindTaskbars()
     {
-        lock (_lock)
-        {
-            _taskbarHwnds.Clear();
-            var primary = FindWindow("Shell_TrayWnd", null);
-            if (primary != IntPtr.Zero)
-                _taskbarHwnds.Add(primary);
+        var result = new List<IntPtr>();
+        var primary = FindWindow("Shell_TrayWnd", null);
+        if (primary != IntPtr.Zero) result.Add(primary);
 
-            IntPtr hwnd = IntPtr.Zero;
-            while (true)
-            {
-                hwnd = FindWindowEx(IntPtr.Zero, hwnd, "Shell_SecondaryTrayWnd", null);
-                if (hwnd == IntPtr.Zero) break;
-                _taskbarHwnds.Add(hwnd);
-            }
-        }
+        var hwnd = IntPtr.Zero;
+        while ((hwnd = FindWindowEx(IntPtr.Zero, hwnd, "Shell_SecondaryTrayWnd", null)) != IntPtr.Zero)
+            result.Add(hwnd);
+        return result;
     }
 
-    private RECT _primaryMonitorWork;
-
-    public RECT PrimaryMonitorWork => _primaryMonitorWork;
-    public RECT PrimaryMonitorFull => _primaryMonitorFull;
-
-    private RECT _primaryMonitorFull;
-
-    private void RefreshPrimaryMonitor()
+    public static void ShowAllTaskbars()
     {
-        var monitor = MonitorFromPoint(new POINT { X = 0, Y = 0 }, MONITOR_DEFAULTTOPRIMARY);
-        var info = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
-        GetMonitorInfo(monitor, ref info);
-        _primaryMonitorWork = info.rcWork;
-        _primaryMonitorFull = info.rcMonitor;
+        foreach (var hwnd in FindTaskbars())
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     }
 
-    private static void SetTaskbarWindowVisibility(IntPtr hwnd, bool visible)
+    // Windows' own auto-hide setting. Keeping it on gives maximised windows the full screen height.
+    public static void SetAutoHide(bool autoHide)
     {
-        ShowWindow(hwnd, visible ? SW_SHOWNOACTIVATE : SW_HIDE);
-
-        // On Windows 11, ShowWindow may not be enough. Reinforce with SetWindowPos.
-        if (!visible && IsWindowVisible(hwnd))
+        var abd = new APPBARDATA
         {
-            SetWindowPos(hwnd, IntPtr.Zero, 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_HIDEWINDOW);
-        }
-        else if (visible && !IsWindowVisible(hwnd))
-        {
-            SetWindowPos(hwnd, IntPtr.Zero, 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        }
-    }
-
-    private void UpdateBarrier(bool shouldBlock)
-    {
-        if (shouldBlock)
-        {
-            EnsureBarrierWindow();
-            if (_barrierHwnd != IntPtr.Zero)
-            {
-                // Position at bottom edge of primary monitor, 1px tall
-                var r = _primaryMonitorWork;
-                // The work area excludes the taskbar when visible. Use the full monitor bottom.
-                var monitor = MonitorFromPoint(new POINT { X = 0, Y = 0 }, MONITOR_DEFAULTTOPRIMARY);
-                var info = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
-                GetMonitorInfo(monitor, ref info);
-                int bottom = info.rcMonitor.Bottom;
-                int left = info.rcMonitor.Left;
-                int width = info.rcMonitor.Right - info.rcMonitor.Left;
-
-                SetWindowPos(_barrierHwnd, HWND_TOPMOST, left, bottom - 1, width, 1,
-                    SWP_NOACTIVATE | SWP_SHOWWINDOW);
-            }
-        }
-        else if (_barrierHwnd != IntPtr.Zero)
-        {
-            ShowWindow(_barrierHwnd, SW_HIDE);
-        }
-    }
-
-    private void EnsureBarrierWindow()
-    {
-        if (_barrierHwnd != IntPtr.Zero) return;
-
-        _barrierWndProc = (hWnd, msg, wParam, lParam) => DefWindowProc(hWnd, msg, wParam, lParam);
-
-        var wc = new WNDCLASSEX
-        {
-            cbSize = Marshal.SizeOf<WNDCLASSEX>(),
-            lpfnWndProc = _barrierWndProc,
-            hInstance = GetModuleHandle(null),
-            lpszClassName = "ButteryTaskbar3_Barrier",
-            hCursor = LoadCursor(IntPtr.Zero, 32512), // IDC_ARROW
+            cbSize = Marshal.SizeOf<APPBARDATA>(),
+            hWnd = FindWindow("Shell_TrayWnd", null),
+            lParam = autoHide ? ABS_AUTOHIDE : IntPtr.Zero,
         };
-        RegisterClassEx(ref wc);
-
-        _barrierHwnd = CreateWindowEx(
-            (uint)(WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_NOACTIVATE),
-            "ButteryTaskbar3_Barrier",
-            "",
-            0x80000000, // WS_POPUP
-            0, 0, 0, 0,
-            IntPtr.Zero, IntPtr.Zero,
-            GetModuleHandle(null),
-            IntPtr.Zero);
-
-        if (_barrierHwnd != IntPtr.Zero)
-        {
-            // Make fully transparent
-            SetLayeredWindowAttributes(_barrierHwnd, 0, 0, 0x02); // LWA_ALPHA
-        }
+        SHAppBarMessage(ABM_SETSTATE, ref abd);
     }
 
-    [DllImport("user32.dll")]
-    private static extern bool SetLayeredWindowAttributes(IntPtr hwnd, uint crKey, byte bAlpha, uint dwFlags);
+    public static bool IsAutoHideOn()
+    {
+        var abd = new APPBARDATA { cbSize = Marshal.SizeOf<APPBARDATA>() };
+        return (SHAppBarMessage(ABM_GETSTATE, ref abd) & ABS_AUTOHIDE) != 0;
+    }
 
-    private static void SimulateWinKeyPress()
+    private static void SimulateWinKeyTap()
     {
         var inputs = new INPUT[2];
         inputs[0].type = INPUT_KEYBOARD;
-        inputs[0].u.ki.wVk = (ushort)VK_LWIN;
+        inputs[0].u.ki.wVk = VK_LWIN;
         inputs[1].type = INPUT_KEYBOARD;
-        inputs[1].u.ki.wVk = (ushort)VK_LWIN;
+        inputs[1].u.ki.wVk = VK_LWIN;
         inputs[1].u.ki.dwFlags = KEYEVENTF_KEYUP;
-        SendInput(2, inputs, Marshal.SizeOf<INPUT>());
+        uint sent = SendInput(2, inputs, Marshal.SizeOf<INPUT>());
+        Log.Write($"SendInput Win tap: sent {sent}/2 (sizeof INPUT = {Marshal.SizeOf<INPUT>()})");
+    }
+
+    private static readonly HashSet<string> ShellWindowClasses = new(StringComparer.Ordinal)
+    {
+        "Shell_TrayWnd",
+        "Shell_SecondaryTrayWnd",
+        "NotifyIconOverflowWindow",            // Windows 10 tray overflow
+        "TopLevelWindowForOverflowXamlIsland", // Windows 11 tray overflow
+        "XamlExplorerHostIslandWindow",        // Task View
+    };
+
+    // CoreWindow is also used by ordinary apps, so it only counts when one of these shell processes owns it.
+    private static readonly HashSet<string> ShellCoreWindowProcesses = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "SearchHost",              // Start menu and search on Windows 11
+        "StartMenuExperienceHost", // Start menu on other builds
+        "SearchApp",               // Search on Windows 10
+        "ShellExperienceHost",     // Notification centre and quick settings
+    };
+
+    public static bool IsShellUi(IntPtr hwnd)
+    {
+        if (hwnd == IntPtr.Zero) return false;
+        var className = GetWindowClassName(hwnd);
+        if (ShellWindowClasses.Contains(className)) return true;
+        return className == "Windows.UI.Core.CoreWindow"
+            && ShellCoreWindowProcesses.Contains(GetProcessName(hwnd));
     }
 
     public static string GetWindowClassName(IntPtr hwnd)
@@ -316,63 +189,21 @@ internal sealed class TaskbarManager : IDisposable
         return new string(buf, 0, len);
     }
 
-    private static string GetProcessName(IntPtr hwnd)
+    public static string GetProcessName(IntPtr hwnd)
     {
         GetWindowThreadProcessId(hwnd, out uint pid);
         try
         {
-            using var proc = Process.GetProcessById((int)pid);
-            return proc.ProcessName;
+            using var process = Process.GetProcessById((int)pid);
+            return process.ProcessName;
         }
-        catch
+        catch (ArgumentException)
         {
             return "";
         }
-    }
-
-    // Window classes and processes that indicate the taskbar should stay visible
-    private static readonly HashSet<string> SystemOverlayClasses = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "Shell_TrayWnd",
-        "Shell_SecondaryTrayWnd",
-        "TopLevelWindowForOverflowXamlIsland",   // Tray overflow (Win11)
-        "XamlExplorerHostIslandWindow",          // Task View
-        "Windows.UI.Core.CoreWindow",            // Start menu, Action Center, Notifications
-        "Windows.UI.Input.InputSite.WindowClass", // Touch keyboard area
-        "Shell_InputSwitchTopLevelWindow",       // Input method switcher
-    };
-
-    private static readonly HashSet<string> SystemOverlayProcesses = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "StartMenuExperienceHost",    // Win11 Start menu
-        "SearchHost",                 // Win10/11 Search
-        "SearchApp",                  // Win11 23H2+ Search
-        "ShellExperienceHost",        // Action Center, Widgets
-        "SystemSettings",             // Quick Settings
-        "TextInputHost",              // Emoji picker, touch keyboard
-        "WidgetService",              // Widgets panel
-        "Widgets",                    // Widgets panel
-    };
-
-    private static bool IsSystemOverlayWindow(string className, string processName)
-    {
-        if (SystemOverlayClasses.Contains(className)) return true;
-        if (SystemOverlayProcesses.Contains(processName)) return true;
-        return false;
-    }
-
-    public void Dispose()
-    {
-        _stopping = true;
-        _wake.Set();
-        _thread?.Join(2000);
-
-        if (_barrierHwnd != IntPtr.Zero)
+        catch (InvalidOperationException)
         {
-            DestroyWindow(_barrierHwnd);
-            _barrierHwnd = IntPtr.Zero;
+            return "";
         }
-
-        _wake.Dispose();
     }
 }

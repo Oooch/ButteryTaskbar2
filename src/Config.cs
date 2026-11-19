@@ -1,4 +1,3 @@
-using System.Runtime.InteropServices;
 using System.Text.Json;
 
 namespace ButteryTaskbar3;
@@ -39,11 +38,10 @@ internal sealed class Config
         }
         catch { }
 
-        var config = new Config();
-        // Check if Windows auto-hide is already enabled
-        var abd = new NativeMethods.APPBARDATA { cbSize = Marshal.SizeOf<NativeMethods.APPBARDATA>() };
-        var state = NativeMethods.SHAppBarMessage(NativeMethods.ABM_GETSTATE, ref abd);
-        config.AutohideWhenDisabled = (state & NativeMethods.ABS_AUTOHIDE) != 0;
+        // Saved straight away so the user's original auto-hide setting is captured before this app
+        // ever changes it; re-reading it on later launches would pick up state left by a crash.
+        var config = new Config { AutohideWhenDisabled = TaskbarManager.IsAutoHideOn() };
+        config.Save();
         return config;
     }
 }

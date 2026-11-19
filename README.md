@@ -38,11 +38,17 @@ Create a Task Scheduler entry that runs `ButteryTaskbar3.exe` at log-on. In its 
 
 ## Quitting
 
-Use **Quit** in the tray menu. This puts the taskbar back the way it was.
+Use **Quit** in the tray menu, or run:
 
-If the process is killed instead (Task Manager, `Stop-Process`), it has no chance to clean up and the taskbar stays hidden. To get it back, either:
+```powershell
+ButteryTaskbar3.exe --quit
+```
 
-- start Buttery Taskbar again and choose **Quit** from the tray menu, or
+Either way the taskbar comes back. Windows' own auto-hide is turned back off, unless "Auto-hide when disabled" is ticked. That setting starts out matching your Windows auto-hide setting from the first time you ran the app.
+
+If the process is killed instead (Task Manager, `Stop-Process`, `taskkill /F`), it can't clean up and the taskbar stays hidden. To get it back, either:
+
+- start Buttery Taskbar again, then quit it properly, or
 - restart Windows Explorer from Task Manager, then turn off "Automatically hide the taskbar" in Settings > Personalisation > Taskbar > Taskbar behaviours.
 
 ## License

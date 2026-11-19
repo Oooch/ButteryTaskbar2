@@ -1,4 +1,3 @@
-using System.Runtime.InteropServices;
 using static ButteryTaskbar3.NativeMethods;
 
 namespace ButteryTaskbar3;
@@ -6,21 +5,35 @@ namespace ButteryTaskbar3;
 internal static class Program
 {
     private const string AppName = "Buttery Taskbar 3";
-    private const string AppVersion = "3.0.0";
+    private const string AppVersion = "3.0.1";
     private const string MutexName = "ButteryTaskbar3_SingleInstance";
+    private const string MessageWindowTitle = "ButteryTaskbar3.MessageWindow";
+    private const uint WM_TOGGLE_ENABLED = WM_APP + 1;
 
     private static Config _config = null!;
     private static TaskbarManager _taskbar = null!;
     private static HookManager _hooks = null!;
+    private static MessageWindow _messageWindow = null!;
     private static NotifyIcon _trayIcon = null!;
-    private static IntPtr _shellHookHwnd;
-    private static uint _shellHookMsg;
-    private static WndProc? _wndProc; // prevent GC collection
-    private static bool _originalAutoHideState;
+    private static WinEventProc? _foregroundProc;
+    private static IntPtr _foregroundHook;
+    private static bool _shutDown;
+
+    private static ToolStripMenuItem _enabledItem = null!;
+    private static ToolStripMenuItem _shortcutItem = null!;
+    private static ToolStripMenuItem _scrollItem = null!;
+    private static ToolStripMenuItem _autoHideItem = null!;
 
     [STAThread]
-    static void Main()
+    static void Main(string[] args)
     {
+        if (args.Contains("--quit", StringComparer.OrdinalIgnoreCase))
+        {
+            var running = FindWindow(null, MessageWindowTitle);
+            if (running != IntPtr.Zero) PostMessage(running, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+            return;
+        }
+
         using var mutex = new Mutex(true, MutexName, out bool createdNew);
         if (!createdNew)
         {
@@ -29,91 +42,93 @@ internal static class Program
             return;
         }
 
+        Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
-        Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
+
+        // A crash must never leave the taskbar hidden.
+        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+        Application.ThreadException += (_, e) =>
+        {
+            Log.Write($"UI thread exception: {e.Exception}");
+            Application.Exit();
+        };
+        AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+        {
+            Log.Write($"Unhandled exception: {e.ExceptionObject}");
+            RestoreTaskbar();
+        };
 
         _config = Config.Load();
-
-        // Remember the original auto-hide state so we can restore it on exit
-        var abd = new APPBARDATA { cbSize = Marshal.SizeOf<APPBARDATA>() };
-        _originalAutoHideState = (SHAppBarMessage(ABM_GETSTATE, ref abd) & ABS_AUTOHIDE) != 0;
-
         _taskbar = new TaskbarManager();
-        _hooks = new HookManager(_taskbar, () => _config, ToggleEnabled);
+        _hooks = new HookManager(_taskbar, () => _config,
+            () => PostMessage(_messageWindow.Handle, WM_TOGGLE_ENABLED, IntPtr.Zero, IntPtr.Zero));
+        _messageWindow = new MessageWindow();
 
         SetupTrayIcon();
-        SetupShellHookWindow();
 
-        _taskbar.SetAutoHideState(_config.Enabled, _config.AutohideWhenDisabled);
-        _hooks.UpdateHooks(false);
+        // EVENT_SYSTEM_FOREGROUND fires for the Windows 11 Start menu; the old RegisterShellHookWindow approach did not catch it reliably.
+        _foregroundProc = OnForegroundChanged;
+        _foregroundHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, IntPtr.Zero,
+            _foregroundProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+
+        Log.Write($"Started {AppVersion}, enabled={_config.Enabled}");
+        ApplySettings();
         _taskbar.Start();
 
-        // Initial state
-        if (_config.Enabled)
+        try
         {
-            _taskbar.RefreshTaskbarState();
-            _taskbar.SignalUpdate();
+            Application.Run();
         }
+        finally
+        {
+            Shutdown();
+        }
+    }
 
-        Application.ApplicationExit += (_, _) => Shutdown();
-        Application.Run();
+    private static void ApplySettings()
+    {
+        TaskbarManager.SetAutoHide(_config.Enabled || _config.AutohideWhenDisabled);
+        _hooks.UpdateHooks();
+        _taskbar.ShowForFocus = !_config.Enabled || TaskbarManager.IsShellUi(GetForegroundWindow());
+    }
+
+    private static void OnForegroundChanged(IntPtr hook, uint eventType, IntPtr hwnd,
+        int idObject, int idChild, uint eventThread, uint eventTime)
+    {
+        if (!_config.Enabled) return;
+        bool show = TaskbarManager.IsShellUi(hwnd);
+        Log.Write($"Foreground: {TaskbarManager.GetWindowClassName(hwnd)} ({TaskbarManager.GetProcessName(hwnd)}) -> show={show}");
+        _taskbar.ShowForFocus = show;
+    }
+
+    private static void ToggleEnabled()
+    {
+        _config.Enabled = !_config.Enabled;
+        _config.Save();
+        ApplySettings();
     }
 
     private static void Shutdown()
     {
+        if (_shutDown) return;
+        _shutDown = true;
+        Log.Write("Shutting down");
+
+        if (_foregroundHook != IntPtr.Zero) UnhookWinEvent(_foregroundHook);
         _hooks.Dispose();
-
-        // Forcefully restore taskbar before anything else
-        RestoreTaskbarDirect();
-
-        _taskbar.ShouldShowDueToFocus = true;
-        _taskbar.SignalUpdate();
-        Thread.Sleep(300);
-        _taskbar.Dispose();
-
-        // Restore again after TaskbarManager is done, in case it reverted
-        RestoreTaskbarDirect();
-
-        if (_shellHookHwnd != IntPtr.Zero)
-        {
-            DeregisterShellHookWindow(_shellHookHwnd);
-            DestroyWindow(_shellHookHwnd);
-        }
+        _taskbar.Stop();
+        RestoreTaskbar();
 
         _trayIcon.Visible = false;
         _trayIcon.Dispose();
+        _messageWindow.DestroyHandle();
     }
 
-    private static void RestoreTaskbarDirect()
+    private static void RestoreTaskbar()
     {
-        var taskbar = FindWindow("Shell_TrayWnd", null);
-        if (taskbar != IntPtr.Zero)
-        {
-            ShowWindow(taskbar, SW_SHOWNOACTIVATE);
-            SetWindowPos(taskbar, IntPtr.Zero, 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        }
-
-        // Also show secondary taskbars
-        IntPtr secondary = IntPtr.Zero;
-        while (true)
-        {
-            secondary = FindWindowEx(IntPtr.Zero, secondary, "Shell_SecondaryTrayWnd", null);
-            if (secondary == IntPtr.Zero) break;
-            ShowWindow(secondary, SW_SHOWNOACTIVATE);
-            SetWindowPos(secondary, IntPtr.Zero, 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        }
-
-        // Restore auto-hide to whatever it was before the app started
-        var abd = new APPBARDATA
-        {
-            cbSize = Marshal.SizeOf<APPBARDATA>(),
-            hWnd = taskbar,
-            lParam = _originalAutoHideState ? (IntPtr)ABS_AUTOHIDE : IntPtr.Zero,
-        };
-        SHAppBarMessage(ABM_SETSTATE, ref abd);
+        TaskbarManager.ShowAllTaskbars();
+        TaskbarManager.SetAutoHide(_config?.AutohideWhenDisabled ?? false);
     }
 
     private static Icon CreateTrayIcon()
@@ -123,23 +138,20 @@ internal static class Program
         using var g = Graphics.FromImage(bmp);
         g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
 
-        // Butter yellow rounded rectangle
         using var butterBrush = new SolidBrush(Color.FromArgb(255, 199, 44));
         using var butterPath = new System.Drawing.Drawing2D.GraphicsPath();
-        var butterRect = new Rectangle(2, 6, 28, 18);
-        int radius = 5;
-        butterPath.AddArc(butterRect.X, butterRect.Y, radius * 2, radius * 2, 180, 90);
-        butterPath.AddArc(butterRect.Right - radius * 2, butterRect.Y, radius * 2, radius * 2, 270, 90);
-        butterPath.AddArc(butterRect.Right - radius * 2, butterRect.Bottom - radius * 2, radius * 2, radius * 2, 0, 90);
-        butterPath.AddArc(butterRect.X, butterRect.Bottom - radius * 2, radius * 2, radius * 2, 90, 90);
+        var rect = new Rectangle(2, 6, 28, 18);
+        const int d = 10;
+        butterPath.AddArc(rect.X, rect.Y, d, d, 180, 90);
+        butterPath.AddArc(rect.Right - d, rect.Y, d, d, 270, 90);
+        butterPath.AddArc(rect.Right - d, rect.Bottom - d, d, d, 0, 90);
+        butterPath.AddArc(rect.X, rect.Bottom - d, d, d, 90, 90);
         butterPath.CloseFigure();
         g.FillPath(butterBrush, butterPath);
 
-        // Shine highlight
         using var shineBrush = new SolidBrush(Color.FromArgb(80, 255, 255, 255));
         g.FillRectangle(shineBrush, 5, 8, 12, 6);
 
-        // Taskbar line at the bottom
         using var barBrush = new SolidBrush(Color.FromArgb(200, 60, 60, 60));
         g.FillRectangle(barBrush, 1, 27, 30, 4);
 
@@ -148,183 +160,88 @@ internal static class Program
 
     private static void SetupTrayIcon()
     {
-        var contextMenu = new ContextMenuStrip();
-        UpdateContextMenu(contextMenu);
+        var menu = new ContextMenuStrip();
+
+        var title = new ToolStripLabel($"{AppName} {AppVersion}");
+        title.Font = new Font(title.Font, FontStyle.Bold);
+        menu.Items.Add(title);
+        menu.Items.Add(new ToolStripSeparator());
+
+        _enabledItem = new ToolStripMenuItem("Enabled", null, (_, _) => ToggleEnabled());
+        _shortcutItem = new ToolStripMenuItem("Ctrl+Win+F11 to toggle", null, (_, _) =>
+        {
+            _config.ToggleShortcutEnabled = !_config.ToggleShortcutEnabled;
+            _config.Save();
+            _hooks.UpdateHooks();
+        });
+        _scrollItem = new ToolStripMenuItem("Scroll to reveal taskbar", null, (_, _) =>
+        {
+            _config.ScrollActivationEnabled = !_config.ScrollActivationEnabled;
+            _config.Save();
+            _hooks.UpdateHooks();
+        });
+        _autoHideItem = new ToolStripMenuItem("Auto-hide when disabled", null, (_, _) =>
+        {
+            _config.AutohideWhenDisabled = !_config.AutohideWhenDisabled;
+            _config.Save();
+            ApplySettings();
+        });
+        menu.Items.AddRange([_enabledItem, _shortcutItem, _scrollItem, _autoHideItem, new ToolStripSeparator()]);
+        menu.Items.Add(new ToolStripMenuItem("Quit", null, (_, _) => Application.Exit()));
+
+        menu.Opening += (_, _) =>
+        {
+            _enabledItem.Checked = _config.Enabled;
+            _shortcutItem.Checked = _config.ToggleShortcutEnabled;
+            _scrollItem.Checked = _config.ScrollActivationEnabled;
+            _autoHideItem.Checked = _config.AutohideWhenDisabled;
+        };
 
         _trayIcon = new NotifyIcon
         {
             Icon = CreateTrayIcon(),
             Text = AppName,
             Visible = true,
-            ContextMenuStrip = contextMenu,
+            ContextMenuStrip = menu,
         };
 
+        // NotifyIcon only opens its menu on right-click; reuse its internal method for left-click too.
+        var showContextMenu = typeof(NotifyIcon).GetMethod("ShowContextMenu",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
         _trayIcon.MouseClick += (_, e) =>
         {
-            if (e.Button == MouseButtons.Left)
+            if (e.Button == MouseButtons.Left) showContextMenu?.Invoke(_trayIcon, null);
+        };
+    }
+
+    // Hidden top-level window: receives WM_CLOSE from `--quit`, TaskbarCreated when Explorer
+    // restarts (only broadcast to top-level windows), and toggle requests posted from the keyboard hook.
+    private sealed class MessageWindow : NativeWindow
+    {
+        private static readonly uint TaskbarCreated = RegisterWindowMessage("TaskbarCreated");
+
+        public MessageWindow() => CreateHandle(new CreateParams { Caption = MessageWindowTitle });
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == WM_CLOSE)
             {
-                UpdateContextMenu(_trayIcon.ContextMenuStrip!);
-                var mi = typeof(NotifyIcon).GetMethod("ShowContextMenu",
-                    System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
-                mi?.Invoke(_trayIcon, null);
+                Log.Write("Quit requested");
+                Application.Exit();
+                return;
             }
-        };
-
-        contextMenu.Opening += (_, _) => UpdateContextMenu(contextMenu);
-    }
-
-    private static void UpdateContextMenu(ContextMenuStrip menu)
-    {
-        menu.Items.Clear();
-
-        var titleItem = new ToolStripLabel($"{AppName} {AppVersion}")
-        {
-            Font = new Font(menu.Font, FontStyle.Bold),
-        };
-        menu.Items.Add(titleItem);
-        menu.Items.Add(new ToolStripSeparator());
-
-        var enabledItem = new ToolStripMenuItem(_config.Enabled ? "Enabled" : "Enable")
-        {
-            Checked = _config.Enabled,
-        };
-        enabledItem.Click += (_, _) => ToggleEnabled();
-        menu.Items.Add(enabledItem);
-
-        var shortcutItem = new ToolStripMenuItem("Ctrl+Win+F11 to toggle")
-        {
-            Checked = _config.ToggleShortcutEnabled,
-        };
-        shortcutItem.Click += (_, _) =>
-        {
-            _config.ToggleShortcutEnabled = !_config.ToggleShortcutEnabled;
-            _hooks.UpdateHooks(false);
-            _config.Save();
-        };
-        menu.Items.Add(shortcutItem);
-
-        var scrollItem = new ToolStripMenuItem("Scroll to reveal taskbar")
-        {
-            Checked = _config.ScrollActivationEnabled,
-        };
-        scrollItem.Click += (_, _) =>
-        {
-            _config.ScrollActivationEnabled = !_config.ScrollActivationEnabled;
-            _hooks.UpdateHooks(false);
-            _config.Save();
-        };
-        menu.Items.Add(scrollItem);
-
-        var autoHideItem = new ToolStripMenuItem("Auto-hide when disabled")
-        {
-            Checked = _config.AutohideWhenDisabled,
-        };
-        autoHideItem.Click += (_, _) =>
-        {
-            _config.AutohideWhenDisabled = !_config.AutohideWhenDisabled;
-            _taskbar.SetAutoHideState(_config.Enabled, _config.AutohideWhenDisabled);
-            _taskbar.SignalUpdate();
-            _config.Save();
-        };
-        menu.Items.Add(autoHideItem);
-
-        menu.Items.Add(new ToolStripSeparator());
-
-        var quitItem = new ToolStripMenuItem("Quit");
-        quitItem.Click += (_, _) => Application.Exit();
-        menu.Items.Add(quitItem);
-    }
-
-    private static void ToggleEnabled()
-    {
-        _config.Enabled = !_config.Enabled;
-
-        if (_config.Enabled)
-        {
-            _taskbar.RefreshTaskbarState();
-        }
-        else
-        {
-            _taskbar.ShouldShowDueToFocus = true;
-        }
-
-        _taskbar.SetAutoHideState(_config.Enabled, _config.AutohideWhenDisabled);
-        _taskbar.SignalUpdate();
-        _hooks.UpdateHooks(false);
-        _config.Save();
-    }
-
-    private static void SetupShellHookWindow()
-    {
-        _shellHookMsg = RegisterWindowMessage("SHELLHOOK");
-
-        _wndProc = ShellHookWndProc;
-
-        var wc = new WNDCLASSEX
-        {
-            cbSize = Marshal.SizeOf<WNDCLASSEX>(),
-            lpfnWndProc = _wndProc,
-            hInstance = GetModuleHandle(null),
-            lpszClassName = "ButteryTaskbar3_ShellHook",
-            hCursor = LoadCursor(IntPtr.Zero, 32512),
-        };
-        RegisterClassEx(ref wc);
-
-        _shellHookHwnd = CreateWindowEx(
-            0, "ButteryTaskbar3_ShellHook", AppName, 0,
-            0, 0, 0, 0,
-            IntPtr.Zero, IntPtr.Zero,
-            GetModuleHandle(null), IntPtr.Zero);
-
-        if (_shellHookHwnd != IntPtr.Zero)
-        {
-            RegisterShellHookWindow(_shellHookHwnd);
-        }
-    }
-
-    private static IntPtr ShellHookWndProc(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam)
-    {
-        if (msg == _shellHookMsg && _config.Enabled)
-        {
-            int code = wParam.ToInt32();
-
-            if (code == HSHELL_WINDOWACTIVATED)
+            if (m.Msg == WM_TOGGLE_ENABLED)
             {
-                _taskbar.RefreshTaskbarState();
-                _taskbar.SignalUpdate();
+                ToggleEnabled();
+                return;
             }
-            else if (code == HSHELL_RUDEAPPACTIVATED)
+            if (m.Msg == TaskbarCreated)
             {
-                var activatedWindow = lParam;
-
-                if (activatedWindow == IntPtr.Zero)
-                {
-                    activatedWindow = GetForegroundWindow();
-                    if (activatedWindow != IntPtr.Zero)
-                    {
-                        var className = TaskbarManager.GetWindowClassName(activatedWindow);
-                        if (className is "Shell_TrayWnd"
-                            or "Shell_SecondaryTrayWnd"
-                            or "TopLevelWindowForOverflowXamlIsland"
-                            or "XamlExplorerHostIslandWindow")
-                        {
-                            _taskbar.ShouldShowDueToFocus = true;
-                        }
-                        else
-                        {
-                            _taskbar.ShouldShowDueToFocus = false;
-                        }
-                    }
-                }
-                else
-                {
-                    _taskbar.RefreshTaskbarState();
-                }
-
-                _taskbar.SignalUpdate();
+                Log.Write("Explorer restarted");
+                ApplySettings();
+                _taskbar.Wake();
             }
+            base.WndProc(ref m);
         }
-
-        return DefWindowProc(hwnd, msg, wParam, lParam);
     }
 }
