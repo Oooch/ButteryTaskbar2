@@ -5,3 +5,8 @@
 *.obj
 *.pdb
 local_environment.jai
+
+# .NET
+src/bin/
+src/obj/
+*.user
