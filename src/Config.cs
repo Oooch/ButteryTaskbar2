@@ -8,6 +8,9 @@ internal sealed class Config
     public bool ScrollActivationEnabled { get; set; } = true;
     public bool ToggleShortcutEnabled { get; set; }
     public bool AutohideWhenDisabled { get; set; } = true;
+    public bool HideTaskbarTooltips { get; set; }
+    public bool HideIdleCursor { get; set; }
+    public int HideCursorAfterSeconds { get; set; } = 120;
 
     private static readonly string ConfigDir = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),

@@ -5,15 +5,17 @@ namespace ButteryTaskbar3;
 internal static class Program
 {
     private const string AppName = "Buttery Taskbar 3";
-    private const string AppVersion = "3.0.1";
+    private static readonly string AppVersion = Application.ProductVersion.Split('+')[0];
     private const string MutexName = "ButteryTaskbar3_SingleInstance";
     private const string MessageWindowTitle = "ButteryTaskbar3.MessageWindow";
     private const uint WM_TOGGLE_ENABLED = WM_APP + 1;
+    private const uint WM_SHOW_CURSOR = WM_APP + 2;
 
     private static Config _config = null!;
     private static TaskbarManager _taskbar = null!;
     private static HookManager _hooks = null!;
     private static MessageWindow _messageWindow = null!;
+    private static CursorHider _cursorHider = null!;
     private static NotifyIcon _trayIcon = null!;
     private static WinEventProc? _foregroundProc;
     private static IntPtr _foregroundHook;
@@ -23,6 +25,10 @@ internal static class Program
     private static ToolStripMenuItem _shortcutItem = null!;
     private static ToolStripMenuItem _scrollItem = null!;
     private static ToolStripMenuItem _autoHideItem = null!;
+    private static ToolStripMenuItem _startAtLoginItem = null!;
+    private static ToolStripMenuItem _tooltipsItem = null!;
+    private static ToolStripMenuItem _cursorItem = null!;
+    private static bool _startAtLogin;
 
     [STAThread]
     static void Main(string[] args)
@@ -34,7 +40,17 @@ internal static class Program
             return;
         }
 
-        using var mutex = new Mutex(true, MutexName, out bool createdNew);
+        bool createdNew = false;
+        Mutex? mutex = null;
+        try
+        {
+            mutex = new Mutex(true, MutexName, out createdNew);
+        }
+        catch (UnauthorizedAccessException)
+        {
+            // An elevated copy (started by the log-in task) owns the mutex.
+        }
+        using var ownedMutex = mutex;
         if (!createdNew)
         {
             MessageBox.Show($"{AppName} is already running.", AppName,
@@ -57,13 +73,20 @@ internal static class Program
         {
             Log.Write($"Unhandled exception: {e.ExceptionObject}");
             RestoreTaskbar();
+            if (_config?.HideIdleCursor == true) CursorHider.RestoreSystemCursors();
         };
 
         _config = Config.Load();
         _taskbar = new TaskbarManager();
         _hooks = new HookManager(_taskbar, () => _config,
-            () => PostMessage(_messageWindow.Handle, WM_TOGGLE_ENABLED, IntPtr.Zero, IntPtr.Zero));
+            () => PostMessage(_messageWindow.Handle, WM_TOGGLE_ENABLED, IntPtr.Zero, IntPtr.Zero),
+            () => _cursorHider.OnMouseMoved());
         _messageWindow = new MessageWindow();
+        _cursorHider = new CursorHider(() => _config,
+            () => PostMessage(_messageWindow.Handle, WM_SHOW_CURSOR, IntPtr.Zero, IntPtr.Zero));
+
+        // If a previous run was force-killed while the cursor was hidden, it is still blank.
+        if (_config.HideIdleCursor) CursorHider.RestoreSystemCursors();
 
         SetupTrayIcon();
 
@@ -75,6 +98,7 @@ internal static class Program
         Log.Write($"Started {AppVersion}, enabled={_config.Enabled}");
         ApplySettings();
         _taskbar.Start();
+        RefreshStartAtLogin();
 
         try
         {
@@ -89,7 +113,9 @@ internal static class Program
     private static void ApplySettings()
     {
         TaskbarManager.SetAutoHide(_config.Enabled || _config.AutohideWhenDisabled);
+        if (_config.HideTaskbarTooltips) TaskbarTooltips.SetEnabled(false);
         _hooks.UpdateHooks();
+        _cursorHider.Update();
         _taskbar.ShowForFocus = !_config.Enabled || TaskbarManager.IsShellUi(GetForegroundWindow());
     }
 
@@ -100,6 +126,21 @@ internal static class Program
         bool show = TaskbarManager.IsShellUi(hwnd);
         Log.Write($"Foreground: {TaskbarManager.GetWindowClassName(hwnd)} ({TaskbarManager.GetProcessName(hwnd)}) -> show={show}");
         _taskbar.ShowForFocus = show;
+    }
+
+    // schtasks runs off the UI thread: blocking it would stall the low-level hooks and lag all input.
+    private static async void RefreshStartAtLogin()
+    {
+        _startAtLogin = await Task.Run(StartupTask.IsEnabled);
+    }
+
+    private static async void ToggleStartAtLogin()
+    {
+        _startAtLoginItem.Enabled = false;
+        bool enable = !_startAtLogin;
+        await Task.Run(() => enable ? StartupTask.Enable() : StartupTask.Disable());
+        _startAtLogin = await Task.Run(StartupTask.IsEnabled);
+        _startAtLoginItem.Enabled = true;
     }
 
     private static void ToggleEnabled()
@@ -117,8 +158,10 @@ internal static class Program
 
         if (_foregroundHook != IntPtr.Zero) UnhookWinEvent(_foregroundHook);
         _hooks.Dispose();
+        _cursorHider.Dispose();
         _taskbar.Stop();
         RestoreTaskbar();
+        if (_config.HideTaskbarTooltips) TaskbarTooltips.SetEnabled(true);
 
         _trayIcon.Visible = false;
         _trayIcon.Dispose();
@@ -186,7 +229,22 @@ internal static class Program
             _config.Save();
             ApplySettings();
         });
-        menu.Items.AddRange([_enabledItem, _shortcutItem, _scrollItem, _autoHideItem, new ToolStripSeparator()]);
+        _tooltipsItem = new ToolStripMenuItem("Hide taskbar tooltips", null, (_, _) =>
+        {
+            _config.HideTaskbarTooltips = !_config.HideTaskbarTooltips;
+            _config.Save();
+            TaskbarTooltips.SetEnabled(!_config.HideTaskbarTooltips);
+        });
+        _cursorItem = new ToolStripMenuItem("Hide mouse cursor when idle", null, (_, _) =>
+        {
+            _config.HideIdleCursor = !_config.HideIdleCursor;
+            _config.Save();
+            _hooks.UpdateHooks();
+            _cursorHider.Update();
+        });
+        _startAtLoginItem = new ToolStripMenuItem("Start at log-in", null, (_, _) => ToggleStartAtLogin());
+        menu.Items.AddRange([_enabledItem, _shortcutItem, _scrollItem, _autoHideItem, _tooltipsItem, _cursorItem,
+            _startAtLoginItem, new ToolStripSeparator()]);
         menu.Items.Add(new ToolStripMenuItem("Quit", null, (_, _) => Application.Exit()));
 
         menu.Opening += (_, _) =>
@@ -195,6 +253,9 @@ internal static class Program
             _shortcutItem.Checked = _config.ToggleShortcutEnabled;
             _scrollItem.Checked = _config.ScrollActivationEnabled;
             _autoHideItem.Checked = _config.AutohideWhenDisabled;
+            _tooltipsItem.Checked = _config.HideTaskbarTooltips;
+            _cursorItem.Checked = _config.HideIdleCursor;
+            _startAtLoginItem.Checked = _startAtLogin;
         };
 
         _trayIcon = new NotifyIcon
@@ -220,7 +281,14 @@ internal static class Program
     {
         private static readonly uint TaskbarCreated = RegisterWindowMessage("TaskbarCreated");
 
-        public MessageWindow() => CreateHandle(new CreateParams { Caption = MessageWindowTitle });
+        public MessageWindow()
+        {
+            CreateHandle(new CreateParams { Caption = MessageWindowTitle });
+            // When running elevated, Windows drops messages from normal-privilege processes
+            // (Explorer, `--quit`) unless they are explicitly allowed.
+            ChangeWindowMessageFilterEx(Handle, WM_CLOSE, MSGFLT_ALLOW, IntPtr.Zero);
+            ChangeWindowMessageFilterEx(Handle, TaskbarCreated, MSGFLT_ALLOW, IntPtr.Zero);
+        }
 
         protected override void WndProc(ref Message m)
         {
@@ -235,9 +303,17 @@ internal static class Program
                 ToggleEnabled();
                 return;
             }
+            if (m.Msg == WM_SHOW_CURSOR)
+            {
+                _cursorHider.Show();
+                return;
+            }
             if (m.Msg == TaskbarCreated)
             {
                 Log.Write("Explorer restarted");
+                // NotifyIcon's own window misses this message when elevated, so re-add the icon here.
+                _trayIcon.Visible = false;
+                _trayIcon.Visible = true;
                 ApplySettings();
                 _taskbar.Wake();
             }

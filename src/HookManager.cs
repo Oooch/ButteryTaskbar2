@@ -14,12 +14,14 @@ internal sealed class HookManager : IDisposable
     private readonly TaskbarManager _taskbar;
     private readonly Func<Config> _getConfig;
     private readonly Action _requestToggle;
+    private readonly Action _onMouseMoved;
 
-    public HookManager(TaskbarManager taskbar, Func<Config> getConfig, Action requestToggle)
+    public HookManager(TaskbarManager taskbar, Func<Config> getConfig, Action requestToggle, Action onMouseMoved)
     {
         _taskbar = taskbar;
         _getConfig = getConfig;
         _requestToggle = requestToggle;
+        _onMouseMoved = onMouseMoved;
         _keyboardProc = KeyboardHookProc;
         _mouseProc = MouseHookProc;
     }
@@ -28,7 +30,8 @@ internal sealed class HookManager : IDisposable
     {
         var config = _getConfig();
         SetHook(ref _keyboardHook, WH_KEYBOARD_LL, _keyboardProc, config.Enabled || config.ToggleShortcutEnabled);
-        SetHook(ref _mouseHook, WH_MOUSE_LL, _mouseProc, config.Enabled && config.ScrollActivationEnabled);
+        SetHook(ref _mouseHook, WH_MOUSE_LL, _mouseProc,
+            (config.Enabled && config.ScrollActivationEnabled) || config.HideIdleCursor);
     }
 
     private static void SetHook(ref IntPtr hook, int type, LowLevelProc proc, bool wanted)
@@ -86,7 +89,14 @@ internal sealed class HookManager : IDisposable
 
     private IntPtr MouseHookProc(int nCode, IntPtr wParam, IntPtr lParam)
     {
-        if (nCode >= 0 && wParam.ToInt32() == WM_MOUSEWHEEL)
+        if (nCode < 0) return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
+
+        int msg = wParam.ToInt32();
+        if (msg == WM_MOUSEMOVE)
+        {
+            _onMouseMoved();
+        }
+        else if (msg == WM_MOUSEWHEEL && _getConfig() is { Enabled: true, ScrollActivationEnabled: true })
         {
             var info = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
             var bounds = Screen.PrimaryScreen!.Bounds;

@@ -1,0 +1,81 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Work out version
+        id: version
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          } else {
+            $version = (Select-Xml -Path src/ButteryTaskbar3.csproj -XPath '//Version').Node.InnerText
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Publish (needs .NET Desktop Runtime)
+        run: dotnet publish src -c Release -r win-x64 -p:Version=${{ steps.version.outputs.version }} -o out/framework
+
+      - name: Publish (standalone)
+        run: >-
+          dotnet publish src -c Release -r win-x64 --self-contained
+          -p:Version=${{ steps.version.outputs.version }}
+          -p:EnableCompressionInSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -o out/standalone
+
+      - name: Collect executables
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item out/framework/ButteryTaskbar3.exe dist/ButteryTaskbar3.exe
+          Copy-Item out/standalone/ButteryTaskbar3.exe dist/ButteryTaskbar3-standalone.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ButteryTaskbar3-${{ steps.version.outputs.version }}
+          path: dist/*.exe
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOTES: |
+            **ButteryTaskbar3.exe** is small but needs the [.NET 9 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/9.0).
+
+            **ButteryTaskbar3-standalone.exe** runs without it, but is about 50 MB.
+        run: >-
+          gh release create "$GITHUB_REF_NAME" dist/*.exe
+          --repo "$GITHUB_REPOSITORY"
+          --title "$GITHUB_REF_NAME"
+          --generate-notes
+          --notes "$NOTES"

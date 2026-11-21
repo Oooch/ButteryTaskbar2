@@ -56,9 +56,35 @@ internal static class NativeMethods
     [DllImport("user32.dll")]
     public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
 
+    [DllImport("user32.dll")]
+    public static extern IntPtr CreateCursor(IntPtr hInst, int xHotSpot, int yHotSpot, int nWidth, int nHeight,
+        byte[] pvANDPlane, byte[] pvXORPlane);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr CopyIcon(IntPtr hIcon);
+
+    [DllImport("user32.dll")]
+    public static extern bool DestroyCursor(IntPtr hCursor);
+
+    [DllImport("user32.dll")]
+    public static extern bool SetSystemCursor(IntPtr hcur, uint id);
+
+    [DllImport("user32.dll")]
+    public static extern bool SystemParametersInfo(uint uiAction, uint uiParam, IntPtr pvParam, uint fWinIni);
+
+    [DllImport("user32.dll")]
+    public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+
+    [DllImport("user32.dll")]
+    public static extern bool ChangeWindowMessageFilterEx(IntPtr hwnd, uint message, uint action, IntPtr pChangeFilterStruct);
+
     [DllImport("shell32.dll")]
     public static extern uint SHAppBarMessage(uint dwMessage, ref APPBARDATA pData);
 
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
     public delegate IntPtr LowLevelProc(int nCode, IntPtr wParam, IntPtr lParam);
     public delegate void WinEventProc(IntPtr hWinEventHook, uint eventType, IntPtr hwnd,
         int idObject, int idChild, uint idEventThread, uint dwmsEventTime);
@@ -70,8 +96,12 @@ internal static class NativeMethods
     public const int WM_KEYUP = 0x0101;
     public const int WM_SYSKEYDOWN = 0x0104;
     public const int WM_SYSKEYUP = 0x0105;
+    public const int WM_MOUSEMOVE = 0x0200;
     public const int WM_MOUSEWHEEL = 0x020A;
+    public const int WM_USER = 0x0400;
     public const int WM_APP = 0x8000;
+
+    public const uint GW_OWNER = 4;
 
     public const int VK_CONTROL = 0x11;
     public const int VK_LWIN = 0x5B;
@@ -88,6 +118,9 @@ internal static class NativeMethods
     public const uint EVENT_SYSTEM_FOREGROUND = 0x0003;
     public const uint WINEVENT_OUTOFCONTEXT = 0x0000;
     public const uint WINEVENT_SKIPOWNPROCESS = 0x0002;
+
+    public const uint MSGFLT_ALLOW = 1;
+    public const uint SPI_SETCURSORS = 0x0057;
 
     public const uint INPUT_KEYBOARD = 1;
     public const uint KEYEVENTF_KEYUP = 0x0002;

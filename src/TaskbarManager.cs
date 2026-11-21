@@ -70,11 +70,18 @@ internal sealed class TaskbarManager
             }
 
             var taskbars = FindTaskbars();
+            bool tooltipsHidden = false;
             int attempts = 0;
             while (attempts < 60 && !_stopping)
             {
                 bool inGracePeriod = Environment.TickCount64 < Interlocked.Read(ref _keepVisibleUntil);
                 bool show = _showForFocus || _winKeyDown || inGracePeriod;
+
+                if (!show && !tooltipsHidden)
+                {
+                    TaskbarTooltips.HideVisible();
+                    tooltipsHidden = true;
+                }
 
                 bool allCorrect = true;
                 foreach (var hwnd in taskbars)
@@ -161,7 +168,8 @@ internal sealed class TaskbarManager
         "Shell_SecondaryTrayWnd",
         "NotifyIconOverflowWindow",            // Windows 10 tray overflow
         "TopLevelWindowForOverflowXamlIsland", // Windows 11 tray overflow
-        "XamlExplorerHostIslandWindow",        // Task View
+        // Not XamlExplorerHostIslandWindow (Task View): Alt+Tab uses the same window, which flashed the
+        // taskbar on every switch and could report focus after the target app, leaving the taskbar stuck up.
     };
 
     // CoreWindow is also used by ordinary apps, so it only counts when one of these shell processes owns it.
